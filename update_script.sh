@@ -1,5 +1,8 @@
 #!/bin/bash
 
+set -euo pipefail
+trap 'echo -e "${RED}Прервано!${NC}"; exit 130' SIGINT
+
 # Config
 LOG_FILE="/var/log/universal_updater.log"
 YES_MODE=false
@@ -83,6 +86,13 @@ case $SYSTEM in
         AUTOCLEAN_CMD="pacman -Sc --noconfirm"
         ;;
 
+	"alpine")
+    	UPDATE_CMD="apk update"
+   		UPGRADE_CMD="apk upgrade"
+    	AUTOREMOVE_CMD="apk del --purge"
+    	AUTOCLEAN_CMD="apk cache clean"
+    	;;
+
     # SUSE-based
     "opensuse" | "sles")
         UPDATE_CMD="zypper refresh"
@@ -105,7 +115,7 @@ case $SYSTEM in
         UPGRADE_CMD="pkg_add -u"
         AUTOREMOVE_CMD="pkg_delete -a"
         AUTOCLEAN_CMD="rm -rf /var/cache/pkg/*"
-        ;;
+    ;;
 
     "netbsd")
         UPDATE_CMD="pkgin update"
@@ -120,6 +130,15 @@ case $SYSTEM in
         exit 1
         ;;
 esac
+
+show_help() {
+    echo "Использование: $0 [ПАРАМЕТРЫ]"
+    echo "Параметры:"
+    echo "  -y, --yes          Автоматическое подтверждение"
+    echo "  -k, --clean-kernels Удаление старых ядер"
+    echo "  -l, --log <путь>   Указать лог-файл"
+    echo "  --help             Показать справку"
+}
 
 # Обработка аргументов
 while [[ "$#" -gt 0 ]]; do
@@ -143,10 +162,10 @@ run_command() {
     echo -e "${BLUE}▶ $desc...${NC}"
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] START: $desc" >> "$LOG_FILE"
 
-    if $YES_MODE; then
-        log_cmd=">> \"$LOG_FILE\" 2>&1"
+   if $YES_MODE; then
+        sudo bash -c "$cmd" >> "$LOG_FILE" 2>&1
     else
-        log_cmd="2>&1 | tee -a \"$LOG_FILE\""
+        sudo bash -c "$cmd" 2>&1 | tee -a "$LOG_FILE"
     fi
 
     # Формируем команду безопасно
@@ -167,14 +186,35 @@ run_command() {
     fi
 }
 
+check_disk_space() {
+    local required=100  # Минимум 100MB свободного места
+    local avail=$(df -m / | awk 'NR==2 {print $4}')
+    
+    if [ $avail -lt $required ]; then
+        echo -e "${RED}Недостаточно свободного места!${NC}"
+        exit 1
+    fi
+}
+
 # Проверка прав
 check_sudo() {
-    if [[ $SYSTEM == "openbsd" ]]; then
-        if ! command -v doas &> /dev/null; then
-            echo -e "${RED}Требуется doas!${NC}"
-            exit 1
-        fi
-    fi
+    case $SYSTEM in
+        "openbsd")
+            if ! command -v doas >/dev/null; then
+                echo -e "${RED}Требуется doas для OpenBSD!${NC}"
+                exit 1
+            fi
+            SUDO="doas"
+            ;;
+        *)
+            SUDO="sudo"
+            if [[ $EUID -ne 0 ]]; then
+                if ! $SUDO -n true 2>/dev/null; then
+                    $SUDO -v || exit 1
+                fi
+            fi
+            ;;
+    esac
     if [[ $EUID -ne 0 ]]; then
         echo -e "${YELLOW}Запрос прав sudo...${NC}"
         if ! sudo -n true 2>/dev/null; then
@@ -187,18 +227,18 @@ check_sudo() {
     fi
 }
 
-show_help() {
-    echo "Использование: $0 [ПАРАМЕТРЫ]"
-    echo "Параметры:"
-    echo "  -y, --yes          Автоматическое подтверждение"
-    echo "  -k, --clean-kernels Удаление старых ядер"
-    echo "  -l, --log <путь>   Указать лог-файл"
-    echo "  --help             Показать справку"
+check_log_file() {
+    local log_dir=$(dirname "$LOG_FILE")
+    if [ ! -w "$log_dir" ]; then
+        echo -e "${RED}Нет прав на запись в $log_dir${NC}"
+        exit 1
+    fi
+    touch "$LOG_FILE"
 }
 
 main() {
     check_sudo
-    echo -e "${BLUE}Обнаружен дистрибутив: $DISTRO${NC}"
+    echo -e "${BLUE}Обнаружен дистрибутив: $SYSTEM${NC}"
 
     # Обновление репозиториев
     run_command "$UPDATE_CMD" "Обновление списков пакетов"
@@ -217,12 +257,12 @@ main() {
         "openbsd")
             updates=$(pkg_add -un | grep -c "install")
             ;;
-	"arch" | "manjaro")
+		"arch" | "manjaro")
             updates=$(pacman -Qu | wc -l)
             ;;
     	"opensuse" | "sles")
-            updates=$(zypper list-updates | grep -c "v | ^Repository")
-            ;;
+    		updates=$(zypper --no-refresh list-updates | grep -c '|')
+    		;;
         *)
             updates=1 # Пропускаем проверку для других дистрибутивов
             ;;
